@@ -1,0 +1,20 @@
+# fly.toml file generated for billys-blog on 2023-03-23T23:28:44-04:00
+
+app = "billys-blog"
+kill_signal = "SIGINT"
+kill_timeout = 5
+primary_region = "ord"
+
+[[services]]
+  protocol = "tcp"
+  internal_port = 80
+  processes = ["app"]
+
+  [[services.ports]]
+    port = 80
+    handlers = ["http"]
+    force_https = true
+  [services.concurrency]
+    type = "connections"
+    hard_limit = 105
+    soft_limit = 100

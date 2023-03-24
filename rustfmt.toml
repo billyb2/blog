@@ -1,0 +1,17 @@
+binop_separator = "Back"
+blank_lines_upper_bound = 1
+brace_style = "PreferSameLine"
+wrap_comments = true
+condense_wildcard_suffixes = true
+control_brace_style = "AlwaysSameLine"
+fn_args_layout = "Compressed"
+fn_single_line = true
+format_code_in_doc_comments = true
+format_generated_files = false
+hard_tabs = true
+imports_indent = "Block"
+imports_layout = "HorizontalVertical"
+match_block_trailing_comma = true
+newline_style = "Unix"
+imports_granularity = "Module"
+reorder_imports = true
