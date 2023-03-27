@@ -162,10 +162,11 @@ async fn root(query: Option<Form<SearchQuery>>) -> Html<String> {
 
 	s.push_str(
 		"
-			<form action='/' method='post'>
-				<input type='text' name='title'><br>
-			</form>	
-			",
+		<form action='/' method='post'>
+			<label>Search</label>
+			<input type='text' name='title'><br>
+		</form>	
+		",
 	);
 
 	{
@@ -228,7 +229,7 @@ async fn load_post(
 		path: post_path.clone(),
 	};
 
-	info!(target: "visits", "{}", serde_json::to_string(&visit_log).unwrap());
+	info!(target: "visits", "{}", simd_json::to_string(&visit_log).unwrap());
 
 	let mut transaction = db.begin().await.unwrap();
 	sqlx::query("insert or ignore into visits (path, num_visits) values (?, 0)")

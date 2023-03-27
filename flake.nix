@@ -32,6 +32,8 @@
             cargo-watch
             openssl
             mold
+            sqlite
+            nixpacks
           ];
 
           nativeBuildInputs = with pkgs; [
