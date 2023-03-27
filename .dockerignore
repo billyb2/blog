@@ -1,3 +1,6 @@
 # flyctl launch added from .gitignore
+./Dockerfile
+.git/
 **/target
+target/
 fly.toml

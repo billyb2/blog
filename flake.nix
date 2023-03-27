@@ -30,10 +30,12 @@
             cargo-outdated
             cargo-deny
             cargo-watch
+            openssl
             mold
           ];
 
           nativeBuildInputs = with pkgs; [
+            pkg-config
           ];
 
         };

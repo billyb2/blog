@@ -1,17 +1,30 @@
+mod filters;
+mod search;
+
 use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{self, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
-use axum::extract::Path;
+use axum::extract::{Path, State};
 use axum::response::Html;
-use axum::{routing, Router};
-use chrono::{NaiveDate, ParseError};
+use axum::{routing, Form, Router};
+use axum_client_ip::{SecureClientIp, SecureClientIpSource};
+use chrono::{prelude::*, ParseError};
 use comrak::ComrakOptions;
+use log::{error, info};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use once_cell::sync::Lazy;
+use serde::Serialize;
+use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 use tokio::fs;
 use tokio::sync::{mpsc, RwLock};
+use tokio::time::sleep;
+
+use filters::*;
+use search::*;
 
 struct Post {
 	path: String,
@@ -21,6 +34,7 @@ struct Post {
 	md: String,
 	html: String,
 	public: bool,
+	num_visits: u32,
 }
 
 static POSTS: Lazy<Arc<RwLock<HashMap<String, Post>>>> =
@@ -28,30 +42,81 @@ static POSTS: Lazy<Arc<RwLock<HashMap<String, Post>>>> =
 
 #[tokio::main]
 async fn main() {
+	fern::Dispatch::new()
+		.format(|out, message, record| {
+			out.finish(format_args!(
+				"[{} {}] {}",
+				record.level(),
+				record.target(),
+				message
+			))
+		})
+		.level(log::LevelFilter::Info)
+		.level_for("sqlx", log::LevelFilter::Warn)
+		.chain(std::io::stdout())
+		.chain(fern::log_file("server.log").unwrap())
+		.apply()
+		.unwrap();
+
+	let pool = SqlitePoolOptions::new()
+		.connect("sqlite://database.db")
+		.await
+		.unwrap();
+
 	let app = Router::new()
-		.route("/", routing::get(root))
-		.route("/blog/", routing::get(root))
-		.route("/blog/:post_name", routing::get(load_post));
+		.route("/", routing::get(root).post(root))
+		.route("/blog/", routing::get(root).post(root))
+		.route("/blog/:post_name", routing::get(load_post))
+		.layer(SecureClientIpSource::ConnectInfo.into_extension())
+		.with_state(pool.clone());
 
-	tokio::task::spawn(watch_md());
+	tokio::task::spawn(watch_md(pool.clone()));
+	tokio::task::spawn(update_post_stats(pool.clone()));
 
-	println!("Running server!");
+	info!("Running server at {}!", Utc::now());
 
-	axum::Server::bind(&"0.0.0.0:80".parse().unwrap())
-		.serve(app.into_make_service())
+	axum::Server::bind(&([0; 8], 80).try_into().unwrap())
+		.serve(app.into_make_service_with_connect_info::<SocketAddr>())
 		.await
 		.unwrap();
 }
 
-async fn watch_md() {
+async fn update_post_stats(db: SqlitePool) {
+	loop {
+		{
+			let posts = &mut POSTS.write().await;
+
+			for (path, post) in posts.iter_mut() {
+				let num_visits: (u32,) =
+					sqlx::query_as("select num_visits from visits where path = ?")
+						.bind(path)
+						.fetch_one(&db)
+						.await
+						.unwrap();
+				let num_visits = num_visits.0;
+
+				post.num_visits = num_visits;
+			}
+		}
+
+		#[cfg(debug_assertions)]
+		const NUM_SECONDS_BETWEEN_UDPATES: u64 = 5;
+		#[cfg(not(debug_assertions))]
+		const NUM_SECONDS_BETWEEN_UDPATES: u64 = 60;
+
+		sleep(Duration::from_secs(NUM_SECONDS_BETWEEN_UDPATES)).await;
+	}
+}
+
+async fn watch_md(db: SqlitePool) {
 	let path: PathBuf = "./md/".into();
 
 	// On initialization, generate all posts
 	let mut dir = fs::read_dir(&path).await.unwrap();
 
 	while let Ok(Some(dir_entry)) = dir.next_entry().await {
-		if let Err(err) = gen_static(dir_entry.path()).await {
-			eprintln!("Error generating blog post {:?}: {err:?}", dir_entry.path());
+		if let Err(err) = gen_static(dir_entry.path(), &db).await {
+			error!("Error generating blog post {:?}: {err:?}", dir_entry.path());
 		}
 	}
 
@@ -70,10 +135,12 @@ async fn watch_md() {
 	while let Some(res) = rx.recv().await {
 		let res = res.unwrap();
 
+		let db_ref = &db;
+
 		let gen = |paths: Vec<PathBuf>| async move {
 			for path in paths.into_iter() {
-				if let Err(err) = gen_static(&path).await {
-					eprintln!("Error generating blog post {:?}: {err:?}", path);
+				if let Err(err) = gen_static(&path, db_ref).await {
+					error!("Error generating blog post {:?}: {err:?}", path);
 				}
 			}
 		};
@@ -87,30 +154,48 @@ async fn watch_md() {
 	}
 }
 
-async fn root() -> Html<String> {
-	let posts = search(SearchQuery::title("hello")).await;
+async fn root(query: Option<Form<SearchQuery>>) -> Html<String> {
+	let query = query.unwrap_or_else(|| Form(SearchQuery::empty()));
+	let posts = search_posts(query.0).await;
 
 	let mut s = String::new();
 
-	let all_posts = POSTS.read().await;
+	s.push_str(
+		"
+			<form action='/' method='post'>
+				<input type='text' name='title'><br>
+			</form>	
+			",
+	);
 
-	for post_path in posts {
-		let post = all_posts.get(&post_path).unwrap();
-		s.push_str(&format!(
-			"Post: <a href = '/blog/{}'>{}</a><br>",
-			post.path, post.title,
-		));
+	{
+		let all_posts = POSTS.read().await;
+
+		for post_path in posts {
+			let post = all_posts.get(&post_path).unwrap();
+			s.push_str(&format!(
+				"Post: <a href = '/blog/{}'>{}</a><br>",
+				post.path, post.title,
+			));
+		}
 	}
+
+	apply_html_filters(&mut s, &[styling, add_homepage]);
 
 	Html(s)
 }
 
-async fn load_post(Path(post_name): Path<String>) -> Html<String> {
-	if !post_name.is_ascii() {
-		return not_found();
-	}
+#[derive(Serialize)]
+struct VisitLog {
+	ip: IpAddr,
+	time: DateTime<Utc>,
+	path: String,
+}
 
-	let invalid_name = post_name.chars().any(|char| {
+async fn load_post(
+	Path(post_path): Path<String>, State(db): State<SqlitePool>, secure_ip: SecureClientIp,
+) -> Html<String> {
+	let invalid_name = post_path.chars().any(|char| {
 		let ascii = char as u32;
 		// Check that the char matches [A-Za-z0-9-_]
 		!((ascii >= b'a' as u32 && ascii <= b'z' as u32)
@@ -124,67 +209,56 @@ async fn load_post(Path(post_name): Path<String>) -> Html<String> {
 		return not_found();
 	}
 
-	let posts = POSTS.read().await;
+	let ip = secure_ip.0;
 
-	let post = match posts.get(&post_name) {
-		Some(post) => post,
-		None => return not_found(),
+	let html = {
+		let posts = POSTS.read().await;
+
+		let post = match posts.get(&post_path) {
+			Some(post) => post,
+			None => return not_found(),
+		};
+
+		post.html.clone()
 	};
 
-	Html(post.html.clone())
+	let visit_log = VisitLog {
+		ip,
+		time: Utc::now(),
+		path: post_path.clone(),
+	};
+
+	info!(target: "visits", "{}", serde_json::to_string(&visit_log).unwrap());
+
+	let mut transaction = db.begin().await.unwrap();
+	sqlx::query("insert or ignore into visits (path, num_visits) values (?, 0)")
+		.bind(&post_path)
+		.execute(&mut transaction)
+		.await
+		.unwrap();
+
+	sqlx::query("update visits set num_visits = num_visits + 1 where path = ?")
+		.bind(&post_path)
+		.execute(&mut transaction)
+		.await
+		.unwrap();
+
+	transaction.commit().await.unwrap();
+
+	Html(html)
 }
 
 fn not_found() -> Html<String> {
 	Html("404".to_string())
 }
 
-#[derive(PartialEq)]
-enum WriteTo {
-	Beginning,
-	End,
-}
-
-fn styling(_html: &str) -> (impl ToString, WriteTo) {
-	// Append the css to the beginning of the string
-	(include_str!("../static/style.css"), WriteTo::Beginning)
-}
-
-pub struct SearchQuery {
-	title: Option<String>,
-}
-
-impl SearchQuery {
-	fn title(title: impl ToString) -> Self {
-		Self {
-			title: Some(title.to_string()),
-		}
-	}
-}
-
-async fn search(mut query: SearchQuery) -> Vec<String> {
-	query.title = query.title.map(|title| title.to_lowercase());
-
-	let posts = POSTS.read().await;
-
-	posts
-		.iter()
-		.filter(|(_path, post)| {
-			if let Some(title) = &query.title {
-				post.title.to_lowercase().contains(title)
-			} else {
-				false
-			}
-		})
-		.map(|(_path, post)| post.path.clone())
-		.collect()
-}
-
-async fn gen_static<P: AsRef<path::Path>>(file: P) -> Result<()> {
-	let html_filters = [styling];
+async fn gen_static<P: AsRef<path::Path>>(file: P, db: &SqlitePool) -> Result<()> {
+	let html_filters: &[fn(&str) -> (String, WriteTo)] = &[styling, add_homepage];
+	let md_filters: &[fn(&str, &str, &str, &str, &str) -> (String, WriteTo)] = &[add_metadata];
 
 	let path = file.as_ref();
 
-	let md = fs::read_to_string(&path).await?;
+	let md = fs::read_to_string(path).await?;
 	let mut md_lines = md.lines();
 
 	let path = match md_lines.next() {
@@ -211,18 +285,25 @@ async fn gen_static<P: AsRef<path::Path>>(file: P) -> Result<()> {
 		None => return Err(anyhow!("Invalid markdown file: No date line")),
 	};
 
-	let md: String = md_lines.fold(String::new(), |s, l| s + l + "\n");
+	let mut md: String = md_lines.fold(String::new(), |s, l| s + l + "\n");
+	apply_md_filters(
+		&mut md,
+		&path,
+		&title,
+		&author,
+		&date.to_string(),
+		&md_filters,
+	);
+
 	let mut html = markdown_to_html(&md);
 
-	let (beginning, end): (Vec<_>, Vec<_>) = html_filters
-		.iter()
-		.map(|filter| filter(&html))
-		.partition(|(_, write_to)| *write_to == WriteTo::Beginning);
+	apply_html_filters(&mut html, &html_filters);
 
-	let beginning: String = beginning.into_iter().map(|(s, _)| s.to_string()).collect();
-	let end: String = end.into_iter().map(|(s, _)| s.to_string()).collect();
-
-	html = format!("{}{}{}", beginning, html, end);
+	sqlx::query("insert or ignore into visits (path, num_visits) values (?, 0)")
+		.bind(&path)
+		.execute(db)
+		.await
+		.unwrap();
 
 	let post = Post {
 		author,
@@ -232,8 +313,12 @@ async fn gen_static<P: AsRef<path::Path>>(file: P) -> Result<()> {
 		public,
 		md,
 		html,
+		num_visits: 0,
 	};
-	POSTS.write().await.insert(path, post);
+
+	{
+		POSTS.write().await.insert(path, post);
+	}
 
 	Ok(())
 }
