@@ -8,12 +8,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
-use axum::extract::{Path, State};
-use axum::response::Html;
+use axum::extract::{Path, Query, State};
+use axum::response::{Html, IntoResponse, Response};
 use axum::{routing, Form, Router};
 use axum_client_ip::{SecureClientIp, SecureClientIpSource};
 use chrono::{prelude::*, ParseError};
-use comrak::ComrakOptions;
+use comrak::{ComrakExtensionOptions, ComrakOptions};
 use log::{error, info};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use once_cell::sync::Lazy;
@@ -28,7 +28,6 @@ use search::*;
 
 struct Post {
 	path: String,
-	author: String,
 	date: NaiveDate,
 	title: String,
 	md: String,
@@ -194,8 +193,9 @@ struct VisitLog {
 }
 
 async fn load_post(
-	Path(post_path): Path<String>, State(db): State<SqlitePool>, secure_ip: SecureClientIp,
-) -> Html<String> {
+	Path(post_path): Path<String>, Query(params): Query<HashMap<String, String>>,
+	State(db): State<SqlitePool>, secure_ip: SecureClientIp,
+) -> Response {
 	let invalid_name = post_path.chars().any(|char| {
 		let ascii = char as u32;
 		// Check that the char matches [A-Za-z0-9-_]
@@ -207,20 +207,26 @@ async fn load_post(
 	});
 
 	if invalid_name {
-		return not_found();
+		return not_found().into_response();
 	}
 
 	let ip = secure_ip.0;
 
-	let html = {
+	let (resp, is_html) = {
 		let posts = POSTS.read().await;
 
 		let post = match posts.get(&post_path) {
 			Some(post) => post,
-			None => return not_found(),
+			None => return not_found().into_response(),
 		};
 
-		post.html.clone()
+		let is_html = !params.get("md").is_some();
+		let resp = match is_html {
+			true => post.html.clone(),
+			false => post.md.clone(),
+		};
+
+		(resp, is_html)
 	};
 
 	let visit_log = VisitLog {
@@ -246,7 +252,10 @@ async fn load_post(
 
 	transaction.commit().await.unwrap();
 
-	Html(html)
+	match is_html {
+		true => Html(resp).into_response(),
+		false => resp.into_response(),
+	}
 }
 
 fn not_found() -> Html<String> {
@@ -255,7 +264,7 @@ fn not_found() -> Html<String> {
 
 async fn gen_static<P: AsRef<path::Path>>(file: P, db: &SqlitePool) -> Result<()> {
 	let html_filters: &[fn(&str) -> (String, WriteTo)] = &[styling, add_homepage];
-	let md_filters: &[fn(&str, &str, &str, &str, &str) -> (String, WriteTo)] = &[add_metadata];
+	let md_filters: &[fn(&str, &str, &str, &str) -> (String, WriteTo)] = &[add_metadata];
 
 	let path = file.as_ref();
 
@@ -270,10 +279,6 @@ async fn gen_static<P: AsRef<path::Path>>(file: P, db: &SqlitePool) -> Result<()
 		Some(line) => line.to_string(),
 		None => return Err(anyhow!("Invalid markdown file: No title line")),
 	};
-	let author = match md_lines.next() {
-		Some(line) => line.to_string(),
-		None => return Err(anyhow!("Invalid markdown file: No author line")),
-	};
 	let date: NaiveDate = match md_lines.next() {
 		Some(line) => NaiveDate::parse_from_str(line, "%m/%d/%Y").map_err(|err: ParseError| {
 			anyhow!("error creating date from {line}: {}", err.to_string())
@@ -287,17 +292,9 @@ async fn gen_static<P: AsRef<path::Path>>(file: P, db: &SqlitePool) -> Result<()
 	};
 
 	let mut md: String = md_lines.fold(String::new(), |s, l| s + l + "\n");
-	apply_md_filters(
-		&mut md,
-		&path,
-		&title,
-		&author,
-		&date.to_string(),
-		&md_filters,
-	);
+	apply_md_filters(&mut md, &path, &title, &date.to_string(), &md_filters);
 
 	let mut html = markdown_to_html(&md);
-
 	apply_html_filters(&mut html, &html_filters);
 
 	sqlx::query("insert or ignore into visits (path, num_visits) values (?, 0)")
@@ -307,7 +304,6 @@ async fn gen_static<P: AsRef<path::Path>>(file: P, db: &SqlitePool) -> Result<()
 		.unwrap();
 
 	let post = Post {
-		author,
 		date,
 		path: path.clone(),
 		title,
@@ -325,7 +321,15 @@ async fn gen_static<P: AsRef<path::Path>>(file: P, db: &SqlitePool) -> Result<()
 }
 
 fn markdown_to_html(md: &str) -> String {
-	let html = comrak::markdown_to_html(&md, &ComrakOptions::default());
+	static MARKDOWN_OPTIONS: Lazy<ComrakOptions> = Lazy::new(|| ComrakOptions {
+		extension: ComrakExtensionOptions {
+			strikethrough: true,
+			..Default::default()
+		},
+		..Default::default()
+	});
+
+	let html = comrak::markdown_to_html(&md, &MARKDOWN_OPTIONS);
 	String::from_utf8(minify_html::minify(
 		html.as_bytes(),
 		&minify_html::Cfg::new(),
