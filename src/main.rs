@@ -9,6 +9,8 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use axum::extract::{Path, Query, State};
+use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, ETAG, IF_NONE_MATCH};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::{routing, Form, Router};
 use axum_client_ip::{SecureClientIp, SecureClientIpSource};
@@ -64,6 +66,7 @@ async fn main() {
 
 	let app = Router::new()
 		.route("/", routing::get(root).post(root))
+		.route("/style.css", routing::get(style))
 		.route("/blog/", routing::get(root).post(root))
 		.route("/blog/:post_name", routing::get(load_post))
 		.layer(SecureClientIpSource::ConnectInfo.into_extension())
@@ -220,7 +223,7 @@ async fn load_post(
 			None => return not_found().into_response(),
 		};
 
-		let is_html = !params.get("md").is_some();
+		let is_html = params.get("md").is_none();
 		let resp = match is_html {
 			true => post.html.clone(),
 			false => post.md.clone(),
@@ -263,8 +266,8 @@ fn not_found() -> Html<String> {
 }
 
 async fn gen_static<P: AsRef<path::Path>>(file: P, db: &SqlitePool) -> Result<()> {
-	let html_filters: &[fn(&str) -> (String, WriteTo)] = &[styling, add_homepage];
-	let md_filters: &[fn(&str, &str, &str, &str) -> (String, WriteTo)] = &[add_metadata];
+	let html_filters: &[HtmlFilterFn] = &[styling, add_homepage];
+	let md_filters: &[MdFilterFn] = &[add_metadata];
 
 	let path = file.as_ref();
 
@@ -292,10 +295,10 @@ async fn gen_static<P: AsRef<path::Path>>(file: P, db: &SqlitePool) -> Result<()
 	};
 
 	let mut md: String = md_lines.fold(String::new(), |s, l| s + l + "\n");
-	apply_md_filters(&mut md, &path, &title, &date.to_string(), &md_filters);
+	apply_md_filters(&mut md, &path, &title, &date.to_string(), md_filters);
 
 	let mut html = markdown_to_html(&md);
-	apply_html_filters(&mut html, &html_filters);
+	apply_html_filters(&mut html, html_filters);
 
 	sqlx::query("insert or ignore into visits (path, num_visits) values (?, 0)")
 		.bind(&path)
@@ -329,10 +332,34 @@ fn markdown_to_html(md: &str) -> String {
 		..Default::default()
 	});
 
-	let html = comrak::markdown_to_html(&md, &MARKDOWN_OPTIONS);
+	let html = comrak::markdown_to_html(md, &MARKDOWN_OPTIONS);
 	String::from_utf8(minify_html::minify(
 		html.as_bytes(),
 		&minify_html::Cfg::new(),
 	))
 	.unwrap()
+}
+
+async fn style(headers: HeaderMap) -> (StatusCode, HeaderMap, String) {
+	let bytes = fs::read("./static/style.css").await.unwrap();
+	let hash = blake3::hash(&bytes);
+	let hash = format!("\"{}\"", hash);
+
+	let mut header_map = HeaderMap::with_capacity(2);
+
+	if let Some(hash2) = headers.get(IF_NONE_MATCH) {
+		if hash2.to_str().unwrap() == hash {
+			return (StatusCode::NOT_MODIFIED, header_map, String::new());
+		}
+	}
+
+	header_map.insert(CONTENT_TYPE, HeaderValue::from_str("text/css").unwrap());
+	header_map.insert(ETAG, HeaderValue::from_str(&hash).unwrap());
+
+	println!("{header_map:?}");
+	(
+		StatusCode::OK,
+		header_map,
+		String::from_utf8(bytes).unwrap(),
+	)
 }
