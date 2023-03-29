@@ -1,5 +1,5 @@
 # flyctl launch added from .gitignore
-./Dockerfile
+Dockerfile
 .git/
 **/target
 target/

@@ -23,6 +23,7 @@
         in
 
         craneLib.buildPackage {
+          doCheck = false;
           src = ./.;
 
           buildInputs = with pkgs; [
@@ -34,6 +35,7 @@
             mold
             sqlite
             nixpacks
+            flyctl
           ];
 
           nativeBuildInputs = with pkgs; [

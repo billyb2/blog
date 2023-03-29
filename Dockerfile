@@ -1,18 +1,27 @@
+# syntax = docker/dockerfile:1
+
 FROM nixos/nix as builder
-WORKDIR /build
+RUN mkdir -p /build/
+WORKDIR /build/
 RUN nix-channel --update
 RUN mkdir -p ~/.config/nix/
 RUN echo "experimental-features = nix-command flakes" >> ~/.config/nix/nix.conf
-COPY . .
-RUN nix build && cp ./result/bin/blog
+COPY ./Cargo.lock .
+COPY ./Cargo.toml .
+COPY ./flake.nix .
+COPY ./flake.lock .
+COPY ./rust-toolchain .
+COPY ./.cargo/ ./.cargo/
+COPY ./static/ ./static/
+COPY ./src ./src/
+RUN nix build
 
-FROM debian:bullseye-slim
-RUN mkdir -p /app/
-WORKDIR /app/
-COPY --from=builder /build/result/bin/blog .
-COPY --from=builder /build/blog .
-COPY --from=builder /build/md .
-COPY --from=builder /build/static .
+COPY ./init_db.sh .
+RUN ./init_db.sh
+
+COPY ./md/ ./md/
+
+RUN nix-collect-garbage
 
 EXPOSE 80
-ENTRYPOINT ["./blog"]
+CMD ["./result/bin/blog"]
