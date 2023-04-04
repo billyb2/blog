@@ -6,6 +6,7 @@ WORKDIR /build/
 RUN nix-channel --update
 RUN mkdir -p ~/.config/nix/
 RUN echo "experimental-features = nix-command flakes" >> ~/.config/nix/nix.conf
+COPY ./.cargo/ .
 COPY ./Cargo.lock .
 COPY ./Cargo.toml .
 COPY ./flake.nix .

@@ -1,5 +1,6 @@
 mod filters;
 mod search;
+mod sync;
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -9,7 +10,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use axum::extract::{Path, Query, State};
-use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, ETAG, IF_NONE_MATCH};
+use axum::http::header::{CONTENT_TYPE, ETAG, IF_NONE_MATCH};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::{routing, Form, Router};
@@ -27,6 +28,8 @@ use tokio::time::sleep;
 
 use filters::*;
 use search::*;
+
+use crate::sync::run_mirror_server;
 
 struct Post {
 	path: String,
@@ -72,8 +75,9 @@ async fn main() {
 		.layer(SecureClientIpSource::ConnectInfo.into_extension())
 		.with_state(pool.clone());
 
-	tokio::task::spawn(watch_md(pool.clone()));
-	tokio::task::spawn(update_post_stats(pool.clone()));
+	tokio::spawn(watch_md(pool.clone()));
+	tokio::spawn(update_post_stats(pool.clone()));
+	tokio::spawn(run_mirror_server());
 
 	info!("Running server at {}!", Utc::now());
 
@@ -114,9 +118,8 @@ async fn watch_md(db: SqlitePool) {
 	let path: PathBuf = "./md/".into();
 
 	// On initialization, generate all posts
-	let mut dir = fs::read_dir(&path).await.unwrap();
-
-	while let Ok(Some(dir_entry)) = dir.next_entry().await {
+	for dir_entry in std::fs::read_dir("./md/").unwrap() {
+		let dir_entry = dir_entry.unwrap();
 		if let Err(err) = gen_static(dir_entry.path(), &db).await {
 			error!("Error generating blog post {:?}: {err:?}", dir_entry.path());
 		}

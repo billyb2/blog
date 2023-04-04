@@ -12,9 +12,9 @@ anyhow = "1"
 axum = { version = "0.6", default-features = false }
 axum-client-ip = "0.4"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
-comrak = { version = "0.17", default-features = false }
+comrak = { version = "0.18", default-features = false }
 fern = { version = "0.6", features = ["colored"] }
-futures = { version = "0.3", default-features = false, features = ["executor"] }
+futures = { version = "0.3", default-features = false, features = ["std", "executor"] }
 log = { version = "0.4", default-features = false }
 minify-html = { version ="0.10", default-features = false }
 notify = { version = "5", default-features = false, features = ["crossbeam-channel"] }
@@ -23,8 +23,15 @@ serde = "1"
 sqlx = { version = "0.6", default-features = false, features = ["sqlite", "runtime-tokio-rustls"]}
 tokio = { version = "1", features = ["rt-multi-thread", "io-util", "macros", "fs", "sync"] }
 simd-json = { version = "0.7" }
-blake3 = "1.3.3"
+blake3 = { version = "1" }
+aes-gcm = { version = "0.10" }
+rand = { version = "0.8" }
+hex = { version = "0.4" }
 
 [profile.release]
 lto = "fat"
 codegen-units = 1
+
+[[bin]]
+name = "sync_md"
+path = "src/sync_md.rs"

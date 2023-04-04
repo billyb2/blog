@@ -28,4 +28,22 @@ PORT = "80"
     interval = "15s"
     timeout = "2s"
     grace_period = "1s"
-    restart_limit = 6
+    restart_limit = 3
+
+    
+[[services]]
+  protocol = "tcp"
+  internal_port = 2121
+
+  [[services.ports]]
+    port = 2121
+
+  [services.concurrency]
+    hard_limit = 25
+    soft_limit = 20
+
+  [[services.tcp_checks]]
+    interval = "15s"
+    timeout = "2s"
+    grace_period = "1s"
+    restart_limit = 3

@@ -34,7 +34,6 @@
             openssl
             mold
             sqlite
-            nixpacks
             flyctl
           ];
 
