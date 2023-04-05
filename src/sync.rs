@@ -1,12 +1,14 @@
 use std::{
 	collections::HashMap,
+	fmt::Display,
 	net::{Ipv6Addr, SocketAddr},
 	sync::Arc,
 };
 
 use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit, Nonce};
 use anyhow::{anyhow, Result};
-use log::{info, warn};
+use chrono::{DateTime, Utc};
+use log::{error, info, warn};
 use once_cell::sync::Lazy;
 use tokio::{
 	fs::OpenOptions,
@@ -48,20 +50,29 @@ pub async fn run_mirror_server() -> Result<()> {
 
 	loop {
 		if let Ok((mut sock, addr)) = sock.accept().await {
-			info!("{addr} attempting to connect to md server");
-
 			let expired_nonces = expired_nonces.clone();
 
 			tokio::task::spawn(async move {
 				// FIXME: unwrap
-				let action_byte = sock.read_u8().await.unwrap();
+				let action_byte = match sock.read_u8().await {
+					Ok(b) => b,
+					Err(err) => match err.kind() {
+						std::io::ErrorKind::UnexpectedEof => return,
+						_ => {
+							return;
+						},
+					},
+				};
 				if let Ok(action) = SyncAction::try_from(action_byte) {
 					if let Err(err) = match action {
 						SyncAction::Upload => {
 							handle_upload(sock, addr, expired_nonces.clone()).await
 						},
 					} {
-						warn!("Error handling file upload: {err}");
+						match err.to_string().contains("Internal Server Error:") {
+							true => error!("{err}"),
+							false => info!("Error handling file upload: {err}"),
+						}
 					}
 				} else {
 					let _ = sock
@@ -73,13 +84,14 @@ pub async fn run_mirror_server() -> Result<()> {
 	}
 }
 
-pub struct SyncInfoEnc {
-	pub nonce: [u8; 12],
-	pub enc_data: Vec<u8>,
+struct NonceInfo {
+	nonce: [u8; 12],
+	time_seen: DateTime<Utc>,
 }
 
 async fn handle_upload(
-	sock: TcpStream, _addr: SocketAddr, expired_nonces: Arc<Mutex<HashMap<blake3::Hash, [u8; 12]>>>,
+	sock: TcpStream, _addr: SocketAddr,
+	expired_nonces: Arc<Mutex<HashMap<blake3::Hash, NonceInfo>>>,
 ) -> Result<()> {
 	let mut buffer = [0_u8; 8192];
 
@@ -106,13 +118,22 @@ async fn handle_upload(
 	{
 		let expired_nonces = &mut expired_nonces.lock().await;
 
-		if let Some(exp_nonce) = expired_nonces.get(&dec_data_hash) {
-			if *exp_nonce == buffer[..12] {
+		if let Some(exp_nonce_info) = expired_nonces.get(&dec_data_hash) {
+			if exp_nonce_info.nonce == buffer[..12] {
+				warn!(
+					"Replay attack attempted: nonce {} has been seen before at {} UTC",
+					hex::encode(exp_nonce_info.nonce),
+					exp_nonce_info.time_seen
+				);
 				return Err(anyhow!("Using expired nonce!"));
 			}
 		}
 
-		expired_nonces.insert(dec_data_hash, buffer[..12].try_into().unwrap());
+		let nonce_info = NonceInfo {
+			nonce: buffer[..12].try_into().unwrap(),
+			time_seen: Utc::now(),
+		};
+		expired_nonces.insert(dec_data_hash, nonce_info);
 	}
 
 	let file_name_len = dec_data[0] as usize;
@@ -126,18 +147,22 @@ async fn handle_upload(
 		.copied()
 		.collect();
 
-	println!("{file_name}\n{}", String::from_utf8(md.clone()).unwrap());
-
 	let mut file = OpenOptions::new()
 		.create(true)
 		.truncate(true)
 		.write(true)
 		.open(format!("./md/{file_name}"))
-		.await?;
+		.await
+		.map_err(internal_server_error)?;
 
-	file.write_all(&md).await?;
+	file.write_all(&md).await.map_err(internal_server_error)?;
 
 	info!("Uploaded file {file_name}");
 
 	Ok(())
+}
+
+#[inline]
+fn internal_server_error<E: Display>(err: E) -> anyhow::Error {
+	anyhow!("Internal Server Error: {err}")
 }

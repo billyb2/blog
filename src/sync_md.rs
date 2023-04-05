@@ -85,7 +85,7 @@ async fn send_file(file: DirEntry, server_ip: IpAddr) -> Result<()> {
 		.map_err(|e| anyhow!("{e}"))?;
 
 	// Used to test nonce is working (to prevent replay attacks)
-	for _ in 0..1 {
+	for _ in 0..3 {
 		let mut conn = TcpStream::connect((server_ip, SERVER_PORT)).await?;
 
 		// Ensure the total message is less than 8192 bytes
