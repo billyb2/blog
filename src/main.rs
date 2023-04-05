@@ -39,6 +39,7 @@ struct Post {
 	html: String,
 	public: bool,
 	num_visits: u32,
+	md_hash: blake3::Hash,
 }
 
 static POSTS: Lazy<Arc<RwLock<HashMap<String, Post>>>> =
@@ -200,8 +201,8 @@ struct VisitLog {
 
 async fn load_post(
 	Path(post_path): Path<String>, Query(params): Query<HashMap<String, String>>,
-	State(db): State<SqlitePool>, secure_ip: SecureClientIp,
-) -> Response {
+	State(db): State<SqlitePool>, secure_ip: SecureClientIp, headers: HeaderMap,
+) -> (StatusCode, HeaderMap, Response) {
 	let invalid_name = post_path.chars().any(|char| {
 		let ascii = char as u32;
 		// Check that the char matches [A-Za-z0-9-_]
@@ -213,24 +214,57 @@ async fn load_post(
 	});
 
 	if invalid_name {
-		return not_found().into_response();
+		return (
+			StatusCode::NOT_FOUND,
+			HeaderMap::new(),
+			not_found().into_response(),
+		);
 	}
 
 	let ip = secure_ip.0;
+
+	let mut header_map = HeaderMap::with_capacity(2);
 
 	let (resp, is_html) = {
 		let posts = POSTS.read().await;
 
 		let post = match posts.get(&post_path) {
 			Some(post) => post,
-			None => return not_found().into_response(),
+			None => {
+				return (
+					StatusCode::NOT_FOUND,
+					HeaderMap::new(),
+					not_found().into_response(),
+				)
+			},
 		};
+
+		let hash = format!("\"{}\"", &post.md_hash);
+
+		if let Some(hash2) = headers.get(IF_NONE_MATCH) {
+			if hash2.to_str().unwrap() == hash {
+				return (
+					StatusCode::NOT_MODIFIED,
+					header_map,
+					Html(String::new()).into_response(),
+				);
+			}
+		}
 
 		let is_html = params.get("md").is_none();
 		let resp = match is_html {
 			true => post.html.clone(),
 			false => post.md.clone(),
 		};
+
+		let header_val = match is_html {
+			true => HeaderValue::from_str("text/html"),
+			false => HeaderValue::from_str("text"),
+		}
+		.unwrap();
+
+		header_map.insert(CONTENT_TYPE, header_val);
+		header_map.insert(ETAG, HeaderValue::from_str(&hash).unwrap());
 
 		(resp, is_html)
 	};
@@ -259,8 +293,8 @@ async fn load_post(
 	transaction.commit().await.unwrap();
 
 	match is_html {
-		true => Html(resp).into_response(),
-		false => resp.into_response(),
+		true => (StatusCode::OK, header_map, Html(resp).into_response()),
+		false => (StatusCode::OK, header_map, resp.into_response()),
 	}
 }
 
@@ -303,6 +337,8 @@ async fn gen_static<P: AsRef<path::Path>>(file: P, db: &SqlitePool) -> Result<()
 	let mut html = markdown_to_html(&md);
 	apply_html_filters(&mut html, html_filters);
 
+	let md_hash = blake3::hash(md.as_bytes());
+
 	sqlx::query("insert or ignore into visits (path, num_visits) values (?, 0)")
 		.bind(&path)
 		.execute(db)
@@ -317,6 +353,7 @@ async fn gen_static<P: AsRef<path::Path>>(file: P, db: &SqlitePool) -> Result<()
 		md,
 		html,
 		num_visits: 0,
+		md_hash,
 	};
 
 	{
